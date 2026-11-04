@@ -70,6 +70,17 @@ case "${GPU_ARCH_TYPE:-BLANK}" in
               retry bash scripts/install_triton_wheel.sh
             fi
             python3 tools/native_aot/build_stage2.py --wheel "${RAW_WHEEL}"
+
+            # Capture before another Python iteration can relink torch_cuda.
+            # The upload uses a separate directory so the working prebolt copy
+            # is not uploaded again alongside the content-addressed variants.
+            if [[ -d "${PYTORCH_ROOT}/build/lib/prebolt" ]]; then
+                if ! python3 "${SCRIPTPATH}/preserve_prebolt_cuda.py" \
+                    --source "${PYTORCH_ROOT}/build/lib/prebolt/libtorch_cuda.so" \
+                    --destination "${PYTORCH_ROOT}/build/lib/prebolt-artifact"; then
+                    echo "::warning::could not preserve the pre-BOLT CUDA library for Python ${DESIRED_PYTHON}"
+                fi
+            fi
         fi  # GPU_ARCH_TYPE == cuda*
 
         python3 "${SCRIPTPATH}/repair_wheel.py" "${RAW_WHEEL_DIR}" "${PYTORCH_FINAL_PACKAGE_DIR}"

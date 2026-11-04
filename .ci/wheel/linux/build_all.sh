@@ -28,6 +28,10 @@ SCRIPTPATH="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"
 PARENT_OUT_DIR="${PYTORCH_FINAL_PACKAGE_DIR}"
 mkdir -p "${PARENT_OUT_DIR}"
 
+# This directory is only for the optional upload, never a build input.
+prebolt_artifact_dir="${PYTORCH_ROOT}/build/lib/prebolt-artifact"
+rm -rf "${prebolt_artifact_dir}"
+
 iter=0
 for desired in ${DESIRED_PYTHONS}; do
     echo "::group::Build wheel for Python ${desired}"
@@ -49,13 +53,13 @@ for desired in ${DESIRED_PYTHONS}; do
         bash "${SCRIPTPATH}/build.sh"
 
     # BOLT keeps the unoptimized libtorch_python, relinked per interpreter, in
-    # build/lib/prebolt; keep one copy per Python SOABI (the key of its BOLT
+    # build/lib/prebolt; archive one copy per Python SOABI (the key of its BOLT
     # profile) before the next iteration.
     prebolt_dir="${PYTORCH_ROOT}/build/lib/prebolt"
     if [[ -f "${prebolt_dir}/libtorch_python.so" ]]; then
         # Best effort: this only feeds an optional artifact, so never fail the build.
         soabi=$(DESIRED_PYTHON="${desired}" bash -c 'source "$1/set_desired_python.sh" >/dev/null && python3 -c "import sysconfig; print(sysconfig.get_config_var(\"SOABI\"))"' _ "${SCRIPTPATH}") || soabi=""
-        if [[ -z "${soabi}" ]] || ! mkdir -p "${prebolt_dir}/${soabi}" || ! mv "${prebolt_dir}/libtorch_python.so" "${prebolt_dir}/${soabi}/"; then
+        if [[ -z "${soabi}" ]] || ! mkdir -p "${prebolt_artifact_dir}/${soabi}" || ! mv "${prebolt_dir}/libtorch_python.so" "${prebolt_artifact_dir}/${soabi}/"; then
             echo "::warning::could not keep the pre-BOLT libtorch_python for Python ${desired}"
         fi
     fi
@@ -72,4 +76,14 @@ for desired in ${DESIRED_PYTHONS}; do
     fi
 
     iter=$((iter + 1))
+done
+
+# These libraries are shared across Python builds. CUDA variants were captured
+# in build.sh; do not include the last iteration's working copy a second time.
+for library in libc10.so libc10_cuda.so libtorch_cpu.so; do
+    if [[ -f "${prebolt_dir}/${library}" ]]; then
+        if ! mkdir -p "${prebolt_artifact_dir}" || ! cp "${prebolt_dir}/${library}" "${prebolt_artifact_dir}/"; then
+            echo "::warning::could not preserve the pre-BOLT ${library}"
+        fi
+    fi
 done

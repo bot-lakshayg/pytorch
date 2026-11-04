@@ -349,8 +349,8 @@ jobs:
           path: ${{ runner.temp }}/artifacts/!{{ config['build_name'] }}/*
   {%- endfor %}
   {%- if arch_type == 'cuda-aarch64' %}
-      # LLVM BOLT keeps the unoptimized libraries in build/lib/prebolt, with a
-      # libtorch_python.so per interpreter under prebolt/<SOABI>/ (see
+      # Upload shared libraries, per-SOABI libtorch_python, and bounded,
+      # content-addressed CUDA variants with a Python mapping manifest (see
       # build_all.sh). Publish them with a short retention for profiling
       # (#199067). Optional, so it must not fail the build.
       - uses: !{{ common.upload_artifact_action }}
@@ -358,7 +358,7 @@ jobs:
         continue-on-error: true
         with:
           name: prebolt!{{ build_name_suffix }}
-          path: build/lib/prebolt/
+          path: build/lib/prebolt-artifact/
           if-no-files-found: warn
           retention-days: 7
           compression-level: 1
