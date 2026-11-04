@@ -28,6 +28,9 @@ SCRIPTPATH="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"
 PARENT_OUT_DIR="${PYTORCH_FINAL_PACKAGE_DIR}"
 mkdir -p "${PARENT_OUT_DIR}"
 
+prebolt_snapshot_dir="${PYTORCH_ROOT}/build/lib/prebolt-py315"
+prebolt_snapshot_ready=0
+
 iter=0
 for desired in ${DESIRED_PYTHONS}; do
     echo "::group::Build wheel for Python ${desired}"
@@ -52,11 +55,29 @@ for desired in ${DESIRED_PYTHONS}; do
     # build/lib/prebolt; keep one copy per Python SOABI (the key of its BOLT
     # profile) before the next iteration.
     prebolt_dir="${PYTORCH_ROOT}/build/lib/prebolt"
-    if [[ -f "${prebolt_dir}/libtorch_python.so" ]]; then
+    if [[ "${desired}" != "3.15t" && -f "${prebolt_dir}/libtorch_python.so" ]]; then
         # Best effort: this only feeds an optional artifact, so never fail the build.
         soabi=$(DESIRED_PYTHON="${desired}" bash -c 'source "$1/set_desired_python.sh" >/dev/null && python3 -c "import sysconfig; print(sysconfig.get_config_var(\"SOABI\"))"' _ "${SCRIPTPATH}") || soabi=""
         if [[ -z "${soabi}" ]] || ! mkdir -p "${prebolt_dir}/${soabi}" || ! mv "${prebolt_dir}/libtorch_python.so" "${prebolt_dir}/${soabi}/"; then
             echo "::warning::could not keep the pre-BOLT libtorch_python for Python ${desired}"
+        fi
+    fi
+
+    # Freeze the profiling artifact at 3.15. Later builds (notably 3.15t)
+    # can relink torch_cuda without changing this snapshot. Exclude 3.15t
+    # above as well, even if it is moved earlier in DESIRED_PYTHONS.
+    if [[ "${desired}" == "3.15" && -d "${prebolt_dir}" ]]; then
+        snapshot_tmp=""
+        if snapshot_tmp=$(mktemp -d "${PYTORCH_ROOT}/build/lib/prebolt-py315.XXXXXX") && \
+            cp -a "${prebolt_dir}/." "${snapshot_tmp}/" && \
+            rm -rf "${prebolt_snapshot_dir}" && \
+            mv "${snapshot_tmp}" "${prebolt_snapshot_dir}"; then
+            prebolt_snapshot_ready=1
+        else
+            echo "::warning::could not snapshot the pre-BOLT libraries after Python 3.15"
+            if [[ -n "${snapshot_tmp}" ]]; then
+                rm -rf "${snapshot_tmp}" || true
+            fi
         fi
     fi
 
@@ -73,3 +94,14 @@ for desired in ${DESIRED_PYTHONS}; do
 
     iter=$((iter + 1))
 done
+
+# The upload must not publish a stale or incomplete snapshot if 3.15 is
+# absent or snapshotting fails. This optional artifact never fails the build.
+if [[ "${GPU_ARCH_TYPE:-}" == "cuda-aarch64" && "${prebolt_snapshot_ready}" == 0 ]]; then
+    echo "::warning::no pre-BOLT snapshot captured for Python 3.15; skipping the artifact"
+fi
+if [[ -n "${GITHUB_ENV:-}" ]]; then
+    if ! echo "PREBOLT_PY315_READY=${prebolt_snapshot_ready}" >> "${GITHUB_ENV}"; then
+        echo "::warning::could not enable the pre-BOLT snapshot upload"
+    fi
+fi
