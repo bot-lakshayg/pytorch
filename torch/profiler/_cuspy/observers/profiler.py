@@ -277,10 +277,10 @@ class ProfilerObserver(WindowFinalizerMixin, CuspyObserver):
         # graph_node_id -> blob for graph-captured collectives (no external-correlation link
         # on replay); resolved like graph-node names. NOT reclaimed per graph, reset per run.
         self._metadata_resolver = metadata_resolver
-        # Pre-13.5 fallback for CUDA_EVENT records without graph node ids.
-        self._enable_event_node_ids = enable_event_node_ids
+        # Passive CUDA_EVENT -> graph event-record node bridge (event_id -> graph_node_id),
+        # shared process-global recorder; None unless enabled. See _attach_event_node_ids.
         self._event_node_recorder: Any = None
-        if enable_event_node_ids and not hasattr(CudaEvent, "GRAPH_NODE_ID"):
+        if enable_event_node_ids:
             from torch.profiler._cuspy._event_nodes import _EventNodeRecorder
 
             self._event_node_recorder = _EventNodeRecorder()
@@ -387,6 +387,7 @@ class ProfilerObserver(WindowFinalizerMixin, CuspyObserver):
             # lane. No-op when no resolver is installed.
             if (
                 self._lane_resolver is not None
+                and kind_str != "cuda_event"
                 and "graph_node_id" in frame
                 and "stream_id" in frame
             ):
@@ -620,10 +621,10 @@ class ProfilerObserver(WindowFinalizerMixin, CuspyObserver):
         # Attach the per-collective blob as a "metadata" column on the GPU-op kinds (these
         # columns are this thread's now, no lock). No-op without comms metadata.
         _attach_metadata(columns, meta, self._metadata_resolver)
-        if self._enable_event_node_ids:
-            _attach_event_node_ids(
-                columns, self._event_node_recorder, self._annotation_resolver
-            )
+        _attach_event_node_ids(
+            columns, self._event_node_recorder, self._annotation_resolver
+        )
+        if self._event_node_recorder is not None:
             _add_graph_event_node_spans(
                 columns, start, boundary_ns, self._lane_resolver
             )
@@ -751,10 +752,13 @@ def _attach_metadata(
 def _attach_event_node_ids(
     columns: dict[str, dict[str, Any]], recorder: Any, resolver: Any = None
 ) -> None:
-    """Attach event-record node ids and annotations, using CUPTI's ids when available.
+    """Attach event-record node ids and annotations.
 
-    Older CUPTI releases need the instantiate-time recorder and a positional join.
+    Use CUPTI graph node ids directly when present; older CUPTI uses the positional
+    join against event nodes recorded at graph instantiation.
     """
+    if recorder is None:
+        return
     ce = columns.get("cuda_event")
     if ce is None or not len(ce["event_id"]):
         return
@@ -763,8 +767,6 @@ def _attach_event_node_ids(
         ce["annotation"] = _resolve_annotation_column(
             resolver, gnid, ce.get("source_graph_node_id", gnid)
         )
-        return
-    if recorder is None:
         return
     from torch.profiler._cuspy._event_nodes import resolve_window
 
@@ -786,6 +788,9 @@ def _attach_event_node_ids(
     # an installed one may merge a node's annotation list into a single dict). Resolving it
     # here rather than reading the store directly is what lets _annotation_to_args spread the
     # fields into args -- a raw list is re-serialized to an opaque "annotation" string instead.
+    # These ids come from the recorder's instantiate-time walk, so they are exec ids with no
+    # source counterpart: a graph whose annotations stayed on the capture graph
+    # (annotation_config["key_by"] == "source") resolves its kernels but not its event nodes.
     ce["annotation"] = _resolve_annotation_column(resolver, gnid, gnid)
 
 
@@ -1183,10 +1188,8 @@ def _cuda_event_columns(cols, convert, resolver):
         "start_ns": start_ns,
         "end_ns": start_ns,
     }
-    if (
-        (field := getattr(CudaEvent, "GRAPH_NODE_ID", None)) is not None
-        and field.id in cols
-    ):
+    field = getattr(CudaEvent, "GRAPH_NODE_ID", None)
+    if field is not None and field.id in cols:
         gnid = cols[field.id].astype(np.int64)
         frame["graph_node_id"] = gnid
         frame["source_graph_node_id"] = _source_gnid(cols, CudaEvent, gnid)

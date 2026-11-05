@@ -461,15 +461,12 @@ class _KinetoProfile:
                 from torch.profiler._cuspy._graph_deps import _GraphDependencyRecorder
 
                 _GraphDependencyRecorder().arm()
-            # Older CUPTI needs an early hook to learn event nodes at instantiate.
-            # CUDA 13.5 reports the node ids directly in CUDA_EVENT records.
+            # Same early-arm rationale for the CUDA_EVENT -> graph event-record node bridge:
+            # the recorder reads each graph's event nodes at its one-time instantiate().
             if self._cuspy_config.enable_event_node_ids:
-                from torch.profiler._cuspy.records import CudaEvent
+                from torch.profiler._cuspy._event_nodes import _EventNodeRecorder
 
-                if not hasattr(CudaEvent, "GRAPH_NODE_ID"):
-                    from torch.profiler._cuspy._event_nodes import _EventNodeRecorder
-
-                    _EventNodeRecorder().arm()
+                _EventNodeRecorder().arm()
         elif "cuspy_async_export" in self._custom_profiler_config:
             raise ValueError(
                 "cuspy_async_export is only supported with the cuspy backend"
