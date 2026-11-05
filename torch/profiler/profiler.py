@@ -10,8 +10,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
 from functools import partial
-from typing import Any, TYPE_CHECKING, TypeVar
-from typing_extensions import deprecated, Self
+from typing import Any, Self, TYPE_CHECKING, TypeVar
+from typing_extensions import deprecated
 from warnings import warn
 
 import torch
@@ -461,12 +461,15 @@ class _KinetoProfile:
                 from torch.profiler._cuspy._graph_deps import _GraphDependencyRecorder
 
                 _GraphDependencyRecorder().arm()
-            # Same early-arm rationale for the CUDA_EVENT -> graph event-record node bridge:
-            # the recorder reads each graph's event nodes at its one-time instantiate().
+            # Older CUPTI needs an early hook to learn event nodes at instantiate.
+            # CUDA 13.5 reports the node ids directly in CUDA_EVENT records.
             if self._cuspy_config.enable_event_node_ids:
-                from torch.profiler._cuspy._event_nodes import _EventNodeRecorder
+                from torch.profiler._cuspy.records import CudaEvent
 
-                _EventNodeRecorder().arm()
+                if not hasattr(CudaEvent, "GRAPH_NODE_ID"):
+                    from torch.profiler._cuspy._event_nodes import _EventNodeRecorder
+
+                    _EventNodeRecorder().arm()
         elif "cuspy_async_export" in self._custom_profiler_config:
             raise ValueError(
                 "cuspy_async_export is only supported with the cuspy backend"

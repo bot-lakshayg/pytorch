@@ -805,6 +805,30 @@ class TestCuspyRecordsCUDA(TestCase):
             [{"roofline_id": "fsdp.all_gather_collective", "stream": 61}],
         )
 
+    def test_attach_event_node_ids_from_cupti(self):
+        import numpy as np
+
+        from torch.profiler._cuspy.observers.profiler import _attach_event_node_ids
+
+        exec_nodes = [(7 << 32) | 11, (7 << 32) | 13]
+        source_nodes = [(3 << 32) | 21, (3 << 32) | 23]
+        ce = {
+            "event_id": np.array([5, 5], dtype=np.int64),
+            "graph_node_id": np.array(exec_nodes, dtype=np.int64),
+            "source_graph_node_id": np.array(source_nodes, dtype=np.int64),
+        }
+        annotations = {
+            source_nodes[0]: {"name": "source"},
+            exec_nodes[1]: {"name": "exec"},
+        }
+
+        _attach_event_node_ids({"cuda_event": ce}, None, annotations.get)
+
+        self.assertEqual(ce["graph_node_id"].tolist(), exec_nodes)
+        self.assertEqual(
+            ce["annotation"].tolist(), [{"name": "source"}, {"name": "exec"}]
+        )
+
     def test_graph_event_node_rendered_and_arrowed(self):
         # A resolved graph event-record node renders as an "EventRecord" point span under cat
         # "graph_event_node" on its stream lane, and (with graph_deps) is a dependency-arrow

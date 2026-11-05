@@ -277,10 +277,10 @@ class ProfilerObserver(WindowFinalizerMixin, CuspyObserver):
         # graph_node_id -> blob for graph-captured collectives (no external-correlation link
         # on replay); resolved like graph-node names. NOT reclaimed per graph, reset per run.
         self._metadata_resolver = metadata_resolver
-        # Passive CUDA_EVENT -> graph event-record node bridge (event_id -> graph_node_id),
-        # shared process-global recorder; None unless enabled. See _attach_event_node_ids.
+        # Pre-13.5 fallback for CUDA_EVENT records without graph node ids.
+        self._enable_event_node_ids = enable_event_node_ids
         self._event_node_recorder: Any = None
-        if enable_event_node_ids:
+        if enable_event_node_ids and not hasattr(CudaEvent, "GRAPH_NODE_ID"):
             from torch.profiler._cuspy._event_nodes import _EventNodeRecorder
 
             self._event_node_recorder = _EventNodeRecorder()
@@ -620,10 +620,10 @@ class ProfilerObserver(WindowFinalizerMixin, CuspyObserver):
         # Attach the per-collective blob as a "metadata" column on the GPU-op kinds (these
         # columns are this thread's now, no lock). No-op without comms metadata.
         _attach_metadata(columns, meta, self._metadata_resolver)
-        _attach_event_node_ids(
-            columns, self._event_node_recorder, self._annotation_resolver
-        )
-        if self._event_node_recorder is not None:
+        if self._enable_event_node_ids:
+            _attach_event_node_ids(
+                columns, self._event_node_recorder, self._annotation_resolver
+            )
             _add_graph_event_node_spans(
                 columns, start, boundary_ns, self._lane_resolver
             )
@@ -751,44 +751,41 @@ def _attach_metadata(
 def _attach_event_node_ids(
     columns: dict[str, dict[str, Any]], recorder: Any, resolver: Any = None
 ) -> None:
-    """Learn ``event_id -> graph_node_id`` from this window's launches and attach a
-    ``graph_node_id`` + ``annotation`` column to the ``cuda_event`` frame. Passive: reads only
-    records that already flow (never touches the events). Mutates ``columns`` in place; no-op
-    when the bridge is disabled or there are no CUDA_EVENT records.
+    """Attach event-record node ids and annotations, using CUPTI's ids when available.
 
-    Each graph launch's graphed kernel/memset records share the launch ``correlation_id`` and
-    carry the exec graph id in the upper 32 bits of ``graph_node_id``; the same-launch
-    CUDA_EVENT records execute in ``cuda_event_sync_id`` order. Matching the k-th event record
-    to the graph's k-th ordered event node (recorded at instantiate) yields the mapping."""
-    if recorder is None:
-        return
+    Older CUPTI releases need the instantiate-time recorder and a positional join.
+    """
     ce = columns.get("cuda_event")
     if ce is None or not len(ce["event_id"]):
         return
-    from torch.profiler._cuspy._event_nodes import resolve_window
+    if "graph_node_id" in ce:
+        gnid = ce["graph_node_id"]
+        src_gnid = ce.get("source_graph_node_id", gnid)
+    else:
+        if recorder is None:
+            return
+        from torch.profiler._cuspy._event_nodes import resolve_window
 
-    corr_exec_pairs: list[tuple[int, int]] = []
-    for kind_str in ("kernel", "gpu_memcpy", "gpu_memset"):
-        c = columns.get(kind_str)
-        if c is not None and "graph_node_id" in c:
-            corr_exec_pairs.extend(
-                zip(c["correlation_id"].tolist(), c["graph_node_id"].tolist())
-            )
-    event_rows = list(
-        zip(ce["correlation_id"].tolist(), ce["cuda_event_sync_id"].tolist())
-    )
-    resolved = resolve_window(recorder, corr_exec_pairs, event_rows)
-    gnid = np.array([n or 0 for n in resolved], dtype=np.int64)
-    ce["graph_node_id"] = gnid
+        corr_exec_pairs: list[tuple[int, int]] = []
+        for kind_str in ("kernel", "gpu_memcpy", "gpu_memset"):
+            c = columns.get(kind_str)
+            if c is not None and "graph_node_id" in c:
+                corr_exec_pairs.extend(
+                    zip(c["correlation_id"].tolist(), c["graph_node_id"].tolist())
+                )
+        event_rows = list(
+            zip(ce["correlation_id"].tolist(), ce["cuda_event_sync_id"].tolist())
+        )
+        resolved = resolve_window(recorder, corr_exec_pairs, event_rows)
+        gnid = np.array([n or 0 for n in resolved], dtype=np.int64)
+        ce["graph_node_id"] = gnid
+        src_gnid = gnid
     # Same resolver the GPU-op column builders use, so an event node's annotation arrives in
     # the shape the export expects (the default resolver reads torch.cuda._graph_annotations;
     # an installed one may merge a node's annotation list into a single dict). Resolving it
     # here rather than reading the store directly is what lets _annotation_to_args spread the
     # fields into args -- a raw list is re-serialized to an opaque "annotation" string instead.
-    # These ids come from the recorder's instantiate-time walk, so they are exec ids with no
-    # source counterpart: a graph whose annotations stayed on the capture graph
-    # (annotation_config["key_by"] == "source") resolves its kernels but not its event nodes.
-    ce["annotation"] = _resolve_annotation_column(resolver, gnid, gnid)
+    ce["annotation"] = _resolve_annotation_column(resolver, gnid, src_gnid)
 
 
 def _add_graph_event_node_spans(
@@ -1175,7 +1172,7 @@ def _cuda_event_columns(cols, convert, resolver):
     # a point span (end == start). The frame stays a join input (is_timed=False); the timed
     # graph_event_node span frame is derived from it per window in _add_graph_event_node_spans.
     start_ns = convert(cols[CudaEvent.DEVICE_TIMESTAMP.id])
-    return {
+    frame = {
         "cuda_event_sync_id": cols[CudaEvent.CUDA_EVENT_SYNC_ID.id].astype(np.int64),
         "correlation_id": cols[CudaEvent.CORRELATION_ID.id].astype(np.int64),
         "device_id": cols[CudaEvent.DEVICE_ID.id].astype(np.int64),
@@ -1185,6 +1182,14 @@ def _cuda_event_columns(cols, convert, resolver):
         "start_ns": start_ns,
         "end_ns": start_ns,
     }
+    if (
+        (field := getattr(CudaEvent, "GRAPH_NODE_ID", None)) is not None
+        and field.id in cols
+    ):
+        gnid = cols[field.id].astype(np.int64)
+        frame["graph_node_id"] = gnid
+        frame["source_graph_node_id"] = _source_gnid(cols, CudaEvent, gnid)
+    return frame
 
 
 def _environment_columns(cols, convert, resolver):
