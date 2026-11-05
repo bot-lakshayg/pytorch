@@ -760,32 +760,33 @@ def _attach_event_node_ids(
         return
     if "graph_node_id" in ce:
         gnid = ce["graph_node_id"]
-        src_gnid = ce.get("source_graph_node_id", gnid)
-    else:
-        if recorder is None:
-            return
-        from torch.profiler._cuspy._event_nodes import resolve_window
-
-        corr_exec_pairs: list[tuple[int, int]] = []
-        for kind_str in ("kernel", "gpu_memcpy", "gpu_memset"):
-            c = columns.get(kind_str)
-            if c is not None and "graph_node_id" in c:
-                corr_exec_pairs.extend(
-                    zip(c["correlation_id"].tolist(), c["graph_node_id"].tolist())
-                )
-        event_rows = list(
-            zip(ce["correlation_id"].tolist(), ce["cuda_event_sync_id"].tolist())
+        ce["annotation"] = _resolve_annotation_column(
+            resolver, gnid, ce.get("source_graph_node_id", gnid)
         )
-        resolved = resolve_window(recorder, corr_exec_pairs, event_rows)
-        gnid = np.array([n or 0 for n in resolved], dtype=np.int64)
-        ce["graph_node_id"] = gnid
-        src_gnid = gnid
+        return
+    if recorder is None:
+        return
+    from torch.profiler._cuspy._event_nodes import resolve_window
+
+    corr_exec_pairs: list[tuple[int, int]] = []
+    for kind_str in ("kernel", "gpu_memcpy", "gpu_memset"):
+        c = columns.get(kind_str)
+        if c is not None and "graph_node_id" in c:
+            corr_exec_pairs.extend(
+                zip(c["correlation_id"].tolist(), c["graph_node_id"].tolist())
+            )
+    event_rows = list(
+        zip(ce["correlation_id"].tolist(), ce["cuda_event_sync_id"].tolist())
+    )
+    resolved = resolve_window(recorder, corr_exec_pairs, event_rows)
+    gnid = np.array([n or 0 for n in resolved], dtype=np.int64)
+    ce["graph_node_id"] = gnid
     # Same resolver the GPU-op column builders use, so an event node's annotation arrives in
     # the shape the export expects (the default resolver reads torch.cuda._graph_annotations;
     # an installed one may merge a node's annotation list into a single dict). Resolving it
     # here rather than reading the store directly is what lets _annotation_to_args spread the
     # fields into args -- a raw list is re-serialized to an opaque "annotation" string instead.
-    ce["annotation"] = _resolve_annotation_column(resolver, gnid, src_gnid)
+    ce["annotation"] = _resolve_annotation_column(resolver, gnid, gnid)
 
 
 def _add_graph_event_node_spans(
