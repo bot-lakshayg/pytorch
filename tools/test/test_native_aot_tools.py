@@ -5306,8 +5306,7 @@ class TestRelinkNeverStrandsTheInstalledTorch(unittest.TestCase):
             open(os.path.join(art, "fakeop", "aot_fakeop_cuda.cpp"), "w").close()
             include = os.path.join(art, gen_aot_lib.CMAKE_INCLUDE)
             if stale_include:
-                # What a PREVIOUS run wired up. caffe2/CMakeLists.txt include()s this
-                # file unconditionally, so it is linked by every later configure.
+                # An export selected by a previous stage-2 run.
                 with open(include, "w") as f:
                     f.write('target_sources(torch_cuda PRIVATE "/x/k.o")\n')
             # A dependency of torch_cuda, which the relink may rebuild and stage 2
@@ -5496,6 +5495,13 @@ class TestRelinkNeverStrandsTheInstalledTorch(unittest.TestCase):
             # ...and BOTH streams are captured, or configure.stdout is None and the
             # `in` test below raises TypeError.
             self.assertIs(run.kwargs.get("capture_output"), True)
+
+    def test_the_reconfigure_selects_the_completed_export(self):
+        with self._main() as run:
+            self.assertEqual(run.outcome, "returned 0")
+            self.assertIn(
+                f"-DTORCH_NATIVE_AOT_INCLUDE:FILEPATH={run.include}", run.argv
+            )
 
     def test_a_reconfigure_that_changes_a_forwarded_setting_is_refused(self):
         # EnvVarForwarding FORCEs env vars into the cache, so a stage-2 run in another
@@ -5776,8 +5782,7 @@ class TestModulePathOrder(unittest.TestCase):
 
 
 class TestEmittedCMake(unittest.TestCase):
-    """caffe2/CMakeLists.txt is one include() and holds no logic, so every decision is
-    emitted here. These assert the emitted CALLS, which is what CMake consumes."""
+    """The generated calls attach an explicitly selected export to torch_cuda."""
 
     def _emit(self, tmpdir, dsl=None, arch_list="10.0a", sources=None, objects=None):
         src = os.path.join(tmpdir, "aot_fakeop_cuda.cpp")
@@ -5800,33 +5805,91 @@ class TestEmittedCMake(unittest.TestCase):
         with open(path) as f:
             return f.read()
 
-    def test_caffe2_cmakelists_holds_no_logic(self):
-        # The point of the restructure: one include, and nothing to get wrong. If a
-        # future change starts deriving things in CMake again, this fails.
+    def test_caffe2_selects_only_the_explicit_input(self):
         with open(os.path.join(REPO, "caffe2", "CMakeLists.txt")) as f:
             cmake = f.read()
         naot = [
             l
             for l in cmake.splitlines()
-            if "native_aot" in l and not l.strip().startswith("#")
+            if "native_aot" in l.lower() and not l.strip().startswith("#")
         ]
         self.assertEqual(
             naot,
-            ['  include("${CMAKE_BINARY_DIR}/native_aot/native_aot.cmake" OPTIONAL)'],
-            "caffe2/CMakeLists.txt should contain exactly one native-AOT line",
+            [
+                "  if(TORCH_NATIVE_AOT_INCLUDE)",
+                '    include("${TORCH_NATIVE_AOT_INCLUDE}")',
+            ],
         )
         for gone in ("file(STRINGS", "ARCH_LIST_ABSENT", "_native_aot_normalize"):
             with self.subTest(construct=gone):
                 self.assertNotIn(gone, cmake)
 
-    def test_the_include_line_agrees_with_the_python_constants(self):
-        # Derived from both constants, so moving either fails the literal above.
-        rel = os.path.relpath(
-            build_stage2.NATIVE_AOT_ARTIFACTS_DIR, build_stage2.BUILD_DIR
-        )
-        want = f'"${{CMAKE_BINARY_DIR}}/{rel}/{gen_aot_lib.CMAKE_INCLUDE}"'
+    def test_raw_configures_do_not_inherit_stage_two_sources(self):
+        try:
+            import tomllib
+        except ModuleNotFoundError:
+            import tomli as tomllib
+
+        with open(os.path.join(REPO, "pyproject.toml"), "rb") as f:
+            defines = tomllib.load(f)["tool"]["scikit-build"]["cmake"]["define"]
+        raw_include = defines["TORCH_NATIVE_AOT_INCLUDE"]
+        self.assertEqual(raw_include, "")
         with open(os.path.join(REPO, "caffe2", "CMakeLists.txt")) as f:
-            self.assertIn(want, f.read())
+            cmake = f.read()
+        start = cmake.index("  if(TORCH_NATIVE_AOT_INCLUDE)")
+        selection = cmake[start : cmake.index("  endif()", start) + len("  endif()")]
+
+        with tempfile.TemporaryDirectory() as d:
+            build = os.path.join(d, "build")
+            art = os.path.join(build, "native_aot")
+            os.makedirs(art)
+            for name in ("base.cpp", "kernel.cpp"):
+                open(os.path.join(d, name), "w").close()
+            include = os.path.join(art, gen_aot_lib.CMAKE_INCLUDE)
+            with open(include, "w") as f:
+                f.write(
+                    'target_sources(torch_cuda PRIVATE "${CMAKE_SOURCE_DIR}/kernel.cpp")\n'
+                )
+            with open(os.path.join(d, "CMakeLists.txt"), "w") as f:
+                f.write(
+                    "cmake_minimum_required(VERSION 3.27)\n"
+                    "project(native_aot NONE)\n"
+                    "add_custom_target(torch_cuda SOURCES base.cpp)\n"
+                    f"{selection}\n"
+                    "get_target_property(sources torch_cuda SOURCES)\n"
+                    'file(WRITE "${CMAKE_BINARY_DIR}/sources.txt" "${sources}")\n'
+                )
+
+            # A completed export survives on disk across supported/skipped builds.
+            configure = ["cmake", "-S", d, "-B", build]
+            for selected in (None, include, raw_include, raw_include, include):
+                with self.subTest(selected=selected):
+                    cmd = configure.copy()
+                    if selected is not None:
+                        cmd.append(f"-DTORCH_NATIVE_AOT_INCLUDE:FILEPATH={selected}")
+                    try:
+                        result = subprocess.run(cmd, capture_output=True, text=True)
+                    except FileNotFoundError:
+                        self.skipTest("cmake not found")
+                    self.assertEqual(
+                        result.returncode, 0, result.stdout + result.stderr
+                    )
+                    with open(os.path.join(build, "sources.txt")) as f:
+                        sources = f.read().split(";")
+                    expected = ["base.cpp"]
+                    if selected:
+                        expected.append(os.path.join(d, "kernel.cpp"))
+                    self.assertEqual(sources, expected)
+                    self.assertTrue(os.path.exists(include))
+
+            missing = os.path.join(art, "missing.cmake")
+            result = subprocess.run(
+                [*configure, f"-DTORCH_NATIVE_AOT_INCLUDE={missing}"],
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("missing.cmake", result.stderr)
 
     def test_the_blocks_are_separated_by_one_blank_line(self):
         # The layout lives in the join, not the templates: gluing the blocks together

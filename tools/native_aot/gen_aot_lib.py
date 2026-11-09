@@ -649,9 +649,7 @@ def surviving_sidecars(op: str, sidecars: list[dict]) -> list[dict]:
     return kept
 
 
-# The one file CMake reads, and not data for it to interpret: it IS the CMake
-# calls, so caffe2/CMakeLists.txt is a single include(... OPTIONAL) with no logic.
-# Hence .cmake rather than .txt.
+# CMake calls attaching a completed export to torch_cuda, selected by stage 2.
 CMAKE_INCLUDE = "native_aot.cmake"
 
 NOTHING_TO_EMBED = (
@@ -1020,9 +1018,7 @@ def main(argv: list[str] | None = None) -> None:
                 )
 
     if not os.path.isdir(args.artifacts_dir):
-        # Zero declarations => export wrote nothing and never created
-        # the dir. A normal artifacts-free build, not an error: no
-        # native_aot.cmake is written, and caffe2's include() is OPTIONAL.
+        # Zero declarations can leave no artifacts directory.
         print(f"{args.artifacts_dir}: no artifacts, nothing to generate")
         return
 

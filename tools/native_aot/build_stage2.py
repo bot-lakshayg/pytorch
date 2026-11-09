@@ -10,6 +10,9 @@ is assembled before torch is importable):
   * dev: chained by `spin develop` / `spin install`; after a raw
     `pip install -e .`, run `python tools/native_aot/build_stage2.py`
 
+Raw builds reset TORCH_NATIVE_AOT_INCLUDE; stage 2 selects the completed export
+when reconfiguring, so a later raw build cannot inherit its kernels.
+
 Skips -- leaving a normal artifacts-free build -- when AOT kernels are not
 applicable. Keep this list in sync with should_run(), which reports each one,
 and with CONTRIBUTING.md, which states them for users:
@@ -55,8 +58,7 @@ BUILD_DIR = os.path.join(REPO, "build")
 # directory: a contract with cmake/Codegen.cmake, so the path is spelled once.
 # Joined onto BUILD_DIR at call time, like _cmake_cache_value, so a test can move it.
 ARCH_LIST_RECORD = os.path.join("native_aot", "arch_list.txt")
-# Where caffe2/CMakeLists.txt include()s native_aot.cmake from, as
-# ${CMAKE_BINARY_DIR}/native_aot: a change on either side has to move both.
+# Exported artifacts, selected explicitly for CMake by the stage-2 reconfigure.
 NATIVE_AOT_ARTIFACTS_DIR = os.path.join(BUILD_DIR, "native_aot")
 # See export.py: as a script sys.path[0] is this directory, so the repo root
 # has to go on the path for `tools.native_aot` to import from any cwd. Appended,
@@ -838,12 +840,7 @@ def patch_wheel(wheel_path: str, lib_path: str) -> None:
 
 
 def _invalidate_stale_include() -> None:
-    """Stop this build tree from embedding what a PREVIOUS run wired up.
-
-    caffe2/CMakeLists.txt include()s the generated file unconditionally, and
-    .ci/wheel/linux/build_all.sh shares one build/ across eight interpreters. OVERWRITTEN
-    rather than deleted: CMake registers an include()d file as a configure dependency
-    only if it existed at configure time."""
+    """Disable an earlier export, preserving CMake's dependency on its include."""
     from tools.native_aot.gen_aot_lib import CMAKE_INCLUDE, write_nothing_to_embed
 
     art = NATIVE_AOT_ARTIFACTS_DIR
@@ -950,12 +947,22 @@ def main(argv: list[str] | None = None) -> int:
     # reconfigure can be held to both (see _refuse_settings_drift).
     cmake_exe = _cmake_for_this_build()
     settings_before = _forwarded_settings()
+    from tools.native_aot.gen_aot_lib import CMAKE_INCLUDE, EMBED_STATUS
+
     # Captured because CMake prints its failure context on stdout, and the STATUS line
     # the generated file emits is the only pre-relink evidence that it will embed.
     # --log-level, because that marker is a message(STATUS) and a cached
     # CMAKE_MESSAGE_LOG_LEVEL=WARNING (EnvVarForwarding FORCEs it) would hide it.
     configure = subprocess.run(
-        [cmake_exe, "--log-level=STATUS", "-S", REPO, "-B", BUILD_DIR],
+        [
+            cmake_exe,
+            "--log-level=STATUS",
+            "-S",
+            REPO,
+            "-B",
+            BUILD_DIR,
+            f"-DTORCH_NATIVE_AOT_INCLUDE:FILEPATH={os.path.join(art, CMAKE_INCLUDE)}",
+        ],
         capture_output=True,
         text=True,
     )
@@ -968,8 +975,6 @@ def main(argv: list[str] | None = None) -> int:
         )
     # Ahead of the relink, so a drifting configure cannot reach the installed torch.
     _refuse_settings_drift(settings_before)
-    from tools.native_aot.gen_aot_lib import EMBED_STATUS
-
     if EMBED_STATUS not in configure.stdout:
         raise RuntimeError(
             f"native-AOT stage 2: generation wrote "

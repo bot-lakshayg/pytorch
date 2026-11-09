@@ -28,6 +28,11 @@ build-backend = "scikit_build_core.build"
 minimum-version = "build-system.requires"
 build-dir = "build"
 
+[tool.scikit-build.cmake.define]
+# Stage 2 supplies this input after exporting kernels. Reset it for each raw
+# build, including when reusing build/ across Python versions.
+TORCH_NATIVE_AOT_INCLUDE = ""
+
 [tool.scikit-build.env]
 # MAX_JOBS is PyTorch's umbrella parallelism knob (also read by
 # linters, cpp_extension JIT, nccl/MKLDNN sub-builds); alias it to the
@@ -77,8 +82,7 @@ cmake.define.CMAKE_GENERATOR = "Ninja"
 env.CC = "cl"
 env.CXX = "cl"
 
-# Other than CMAKE_GENERATOR above (win32), cmake.define is intentionally absent
-# -- all BUILD_*/USE_* env vars and additional passthrough variables are
+# Build flags (BUILD_*/USE_* and additional passthrough variables) are
 # forwarded by cmake/EnvVarForwarding.cmake so there is a single source of truth.
 
 [[tool.dynamic-metadata]]
