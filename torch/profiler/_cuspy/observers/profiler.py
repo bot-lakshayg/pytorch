@@ -754,18 +754,18 @@ def _attach_event_node_ids(
 ) -> None:
     """Attach event-record node ids and annotations.
 
-    Use CUPTI graph node ids directly when present; older CUPTI uses the positional
-    join against event nodes recorded at graph instantiation.
+    Use nonzero CUPTI graph node ids directly; otherwise use the positional join
+    against event nodes recorded at graph instantiation.
     """
     if recorder is None:
         return
     ce = columns.get("cuda_event")
     if ce is None or not len(ce["event_id"]):
         return
-    if "graph_node_id" in ce:
-        gnid = ce["graph_node_id"]
+    native = ce.get("graph_node_id")
+    if native is not None and np.all(native != 0):
         ce["annotation"] = _resolve_annotation_column(
-            resolver, gnid, ce.get("source_graph_node_id", gnid)
+            resolver, native, ce.get("source_graph_node_id", native)
         )
         return
     from torch.profiler._cuspy._event_nodes import resolve_window
@@ -782,16 +782,20 @@ def _attach_event_node_ids(
     )
     resolved = resolve_window(recorder, corr_exec_pairs, event_rows)
     gnid = np.array([n or 0 for n in resolved], dtype=np.int64)
+    if native is not None:
+        # Resolve the complete launch before filling holes; never replace native IDs.
+        gnid = np.where(native != 0, native, gnid)
     ce["graph_node_id"] = gnid
     # Same resolver the GPU-op column builders use, so an event node's annotation arrives in
     # the shape the export expects (the default resolver reads torch.cuda._graph_annotations;
     # an installed one may merge a node's annotation list into a single dict). Resolving it
     # here rather than reading the store directly is what lets _annotation_to_args spread the
     # fields into args -- a raw list is re-serialized to an opaque "annotation" string instead.
-    # These ids come from the recorder's instantiate-time walk, so they are exec ids with no
-    # source counterpart: a graph whose annotations stayed on the capture graph
-    # (annotation_config["key_by"] == "source") resolves its kernels but not its event nodes.
-    ce["annotation"] = _resolve_annotation_column(resolver, gnid, gnid)
+    # Inferred ids have no source counterpart, so source-keyed annotations need a native
+    # source id. Preserve those where available and otherwise resolve by exec id.
+    ce["annotation"] = _resolve_annotation_column(
+        resolver, gnid, ce.get("source_graph_node_id", gnid)
+    )
 
 
 def _add_graph_event_node_spans(
@@ -825,6 +829,8 @@ def _add_graph_event_node_spans(
         "graph_id": g >> 32,
         "annotation": ce["annotation"][mask],
     }
+    if "source_graph_node_id" in ce:
+        frame["source_graph_node_id"] = ce["source_graph_node_id"][mask]
     # This frame is synthesized after _on_activities has already run the lane resolver over the
     # _COLUMN_BUILDERS frames, so it has to attach its own lane columns -- without them the
     # export's reassignment is gated off and an event node strands on its capture stream while

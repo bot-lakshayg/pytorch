@@ -36,7 +36,8 @@ a node -- keying on it would collapse every recycled record onto a single node. 
 resolved only when its event-record count matches the graph's node count; otherwise its
 records resolve to ``None``, never guessed.
 
-CUDA 13.5 supplies graph-node ids directly; this module remains for older CUPTI.
+CUDA 13.5 supplies graph-node ids directly; this module remains as a fallback when
+native node ids are unavailable.
 """
 
 from __future__ import annotations

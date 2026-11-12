@@ -34,7 +34,9 @@ from torch.testing._internal.common_cuda import (
 )
 from torch.testing._internal.common_utils import (
     HardwareClassification,
+    instantiate_parametrized_tests,
     IS_WINDOWS,
+    parametrize,
     run_tests,
     skipIfTorchDynamo,
     TemporaryFileName,
@@ -154,6 +156,7 @@ def _pftrace_render_stage_extra(packets):
 
 
 @unittest.skipIf(not TEST_CUPTI_PYTHON, "requires cupti-python")
+@instantiate_parametrized_tests
 class TestCuspyRecordsCUDA(TestCase):
     """Pure Cuspy + metadata unit tests (no GPU)."""
 
@@ -748,6 +751,19 @@ class TestCuspyRecordsCUDA(TestCase):
         _add_graph_event_node_spans(plain, 1000, 2000)
         self.assertNotIn("logical_lane", plain["graph_event_node"])
 
+        source = (3 << 32) | 21
+        native = cols_for()
+        native["cuda_event"]["source_graph_node_id"] = np.array(
+            [source], dtype=np.int64
+        )
+        _add_graph_event_node_spans(
+            native, 1000, 2000, lane_resolver={source: (61, "DP")}.get
+        )
+        span = native["graph_event_node"]
+        self.assertEqual(span["source_graph_node_id"].tolist(), [source])
+        self.assertEqual(span["logical_lane"].tolist(), [LOGICAL_LANE_BASE + 61])
+        self.assertEqual(span["lane_name"].tolist(), ["DP"])
+
     def test_attach_event_node_ids_uses_installed_resolver(self):
         # The annotation column must come from the installed resolver (the same one the GPU-op
         # column builders use), not a direct read of torch.cuda._graph_annotations -- an
@@ -917,6 +933,32 @@ class TestCuspyRecordsCUDA(TestCase):
         _attach_event_node_ids(native, r, {source: "source", n1: "exec"}.get)
         self.assertEqual(native["cuda_event"]["graph_node_id"].tolist(), [n0, n1])
         self.assertEqual(native["cuda_event"]["annotation"].tolist(), ["source", "exec"])
+
+    @parametrize("native_ids", [(0, 0), ((7 << 32) | 11, 0), (0, (7 << 32) | 13)])
+    @parametrize("recorded_nodes", [0, 2, 3])
+    def test_attach_event_node_ids_fills_native_holes(self, native_ids, recorded_nodes):
+        import numpy as np
+
+        from torch.profiler._cuspy.observers.profiler import _attach_event_node_ids
+
+        n0, n1 = (7 << 32) | 11, (7 << 32) | 13
+        recorder = _fresh_event_node_recorder(self)
+        recorder.graph_event_nodes = {7: [n0, n1, n1 + 1][:recorded_nodes]}
+        columns = {
+            "kernel": {
+                "correlation_id": np.array([900], dtype=np.int64),
+                "graph_node_id": np.array([(7 << 32) | 55], dtype=np.int64),
+            },
+            "cuda_event": {
+                "event_id": np.array([5, 5, 6], dtype=np.int64),
+                "correlation_id": np.array([900, 900, 901], dtype=np.int64),
+                "cuda_event_sync_id": np.array([1, 2, 3], dtype=np.int64),
+                "graph_node_id": np.array([*native_ids, 0], dtype=np.int64),
+            },
+        }
+        _attach_event_node_ids(columns, recorder)
+        expected = [n0, n1, 0] if recorded_nodes == 2 else [*native_ids, 0]
+        self.assertEqual(columns["cuda_event"]["graph_node_id"].tolist(), expected)
 
     def test_window_graph_deps_collapses_event_nodes(self):
         # A dependency arrow must span a kernel -> event_record -> wait_event -> kernel chain
